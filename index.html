@@ -435,7 +435,39 @@ document.addEventListener('DOMContentLoaded', async ()=> {
 
   function resetKnob(){ knob.style.transform = 'translate(0px,0px)'; window.joyX = 0; window.joyY = 0; }
   resetKnob();
+  
+function updateFromPoint(e){
+  const rect = joystick.getBoundingClientRect();
+  const cx = rect.left + rect.width/2;
+  const cy = rect.top + rect.height/2;
 
+  const dx = e.clientX - cx;
+  const dy = e.clientY - cy;
+
+  let nx = dx / knobRadius;
+  let ny = dy / knobRadius;
+
+  const len = Math.hypot(nx,ny);
+
+  // dead zone
+  if(len < deadZone){
+    window.joyX = 0;
+    window.joyY = 0;
+    knob.style.transform = 'translate(0px,0px)';
+    return;
+  }
+
+  // clamp
+  if(len > 1){
+    nx /= len;
+    ny /= len;
+  }
+
+  window.joyX = nx;
+  window.joyY = ny;
+
+  knob.style.transform = `translate(${nx*knobRadius}px,${ny*knobRadius}px)`;
+}
   function drawMapFullscreen(){
 
   if(!tileMap) return;
