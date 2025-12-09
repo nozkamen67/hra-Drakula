@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>2D Game with Map</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0" />
+  <style>
+    body { margin: 0; background: #111; overflow: hidden; -webkit-user-select: none; user-select: none; }
+    canvas { display: block; margin: 0 auto; background: #222; }
+    #joystick { position:fixed; left:20px; bottom:40px; width:140px; height:140px; border-radius:50%; background:rgba(68,68,68,0.28); touch-action:none; display:flex; align-items:center; justify-content:center; }
+    #joystickKnob { width:48px; height:48px; border-radius:50%; background:rgba(170,170,170,0.9); transform:translate(0,0); transition: transform 0.06s linear; }
+    #dashBtn { position:fixed; right:26px; bottom:40px; width:120px; height:120px; border-radius:50%; background:#444; font-size:18px; color:white; border:none; }
+    #mapBtn { position:fixed; right:26px; top:20px; width:80px; height:80px; border-radius:20px; background:#444; font-size:18px; color:white; border:none; }
+    /* Start screen adjustments */
+    #startScreen { position:fixed; left:0; top:0; width:100vw; height:100vh; object-fit:contain; z-index:1000; }
+    #startBtn { position:fixed; left:0; top:0; width:100vw; height:100vh; z-index:2000; background:none; border:none; cursor:pointer; }
+  </style>
+</head>
+<body>
+
+<!-- start screen (klik kdekoliv spustí hru) -->
+<img id="startScreen" src="start.png" alt="start" />
+<button id="startBtn" aria-label="Start game"></button>
+
+<div id="joystick"><div id="joystickKnob"></div></div>
+<button id="dashBtn">DASH</button>
+<button id="mapBtn">MAPA</button>
+<canvas id="game"></canvas>
+<img id="gameOverScreen" src="s2.png" style="
+ position:fixed;
+ left:50%;
+ top:50%;
+ transform:translate(-50%,-50%);
+ width:70%;
+ max-width:600px;
+ display:none;
+ z-index:9999;
+ pointer-events:auto;
+">
+<div id="scoreOver" style="
+ position:fixed;
+ left:50%;
+ top:50%;
+ transform:translate(-50%, -50%);
+ color:white;
+ font-size:64px;
+ z-index:10000;
+ pointer-events:none;
+ display:none;
+ text-align:center;
+ font-family:sans-serif;
+ text-shadow:0 0 10px black, 0 0 20px black;
+">
+0
+</div>
+
+<button id="fsBtn" style="position:fixed; left:20px; top:20px; width:80px; height:80px; border-radius:20px; background:#444; color:white; font-size:18px; border:none;">FULL</button>
+
+<script>
+let paused = false;
+let gameStarted = false;
+let gameOver = false;
+let score = 0;
+
+// SPRITES
+const imgLeft = new Image(); imgLeft.src = "pohyb doleva.png";
+const imgDown = new Image(); imgDown.src = "pohyb dopredu.png";
+const imgRight = new Image(); imgRight.src = "pohyb doprava.png";
+const imgUp = new Image(); imgUp.src = "pohyb dozadu.png";
+const enemyImg = new Image(); enemyImg.src = "blood.png"; // uživatelův obrázek
+
+document.addEventListener('DOMContentLoaded', async ()=> {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  function resize(){ canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
+  resize(); window.addEventListener('resize', resize);
+
+  // PLAYER
+  const player = {
+    x:0, y:0,
+    w:24, h:12,
+    offsetX:2, offsetY:28,
+    speed:220,
+    dashDistance:100, dashCooldown:1.5, dashTimer:0, isDashing:false,
+    dashDuration:0.18, dashSpeed:0,
+    health:100, maxHealth:100,
+    anim:{ frame:0, timer:0, speed:0.12, col:1, framesPerDir:7 }
+  };
+  player.dashSpeed = player.dashDistance / player.dashDuration;
+
+  // input
+  let keys = {};
+  document.addEventListener('keydown', e=> keys[e.key]=true);
+  document.addEventListener('keyup', e=> keys[e.key]=false);
+
+  function tryDash(){
+    if(player.dashTimer>0 || player.isDashing) return;
+    let dx=0, dy=0;
+    if(keys.w||keys.ArrowUp) dy=-1;
+    if(keys.s||keys.ArrowDown) dy=1;
+    if(keys.a||keys.ArrowLeft) dx=-1;
+    if(keys.d||keys.ArrowRight) dx=1;
+    if(dx===0 && dy===0 && Math.hypot(window.joyX||0,window.joyY||0)>0.2){ dx=window.joyX; dy=window.joyY; }
+    if(dx===0 && dy===0) return;
+    const L=Math.hypot(dx,dy); dx/=L; dy/=L;
+    const test = moveWithCollision(player.x, player.y, dx*4, dy*4);
+    if(Math.abs(test.x - player.x) < 0.01 && Math.abs(test.y - player.y) < 0.01) return;
+    player.isDashing=true;
+    player.dashTime=player.dashDuration;
+    player.dashVX=dx*player.dashSpeed;
+    player.dashVY=dy*player.dashSpeed;
+    player.dashTimer=player.dashCooldown;
+  }
+  document.addEventListener('keydown', e=> { if(e.key==='Shift') tryDash(); });
+
+  // CAMERA
+  const camera = { x:0, y:0, scale:3 };
+
+  // MAP + COLLISIONS
+  let tileMap = null;
+  let tilesets = [];
+  let collisionObjects = [];
+  let mapReady = false;
+  let worldWidth = 2000, worldHeight = 2000;
+
+  // ENEMIES
+  let enemies = [];
+
+  async function loadTileMap(){
+    try {
+      tileMap = await fetch('drakula.tmj').then(r=>r.json());
+    } catch(err){
+      console.error('Failed loading drakula.tmj', err);
+      return;
+    }
+    worldWidth = tileMap.width * tileMap.tilewidth;
+    worldHeight = tileMap.height * tileMap.tileheight;
+
+    // tilesets
+    tilesets = [];
+    for(const ts of tileMap.tilesets || []){
+      if(!ts.image) continue;
+      const timg = new Image(); timg.src = ts.image;
+      await timg.decode().catch(()=>{ /* ignore */ });
+      const tileW = ts.tilewidth || tileMap.tilewidth;
+      const imageW = ts.imagewidth || timg.width || tileW;
+      const cols = ts.columns || Math.floor(imageW / tileW) || 1;
+      tilesets.push({ firstgid: ts.firstgid, columns: cols, tilewidth: tileW, tileheight: ts.tileheight || tileMap.tileheight, image: timg });
+    }
+
+    // collisions: layer "Vrstva objektů 1"
+    const colLayer = (tileMap.layers || []).find(l=>l.name==="Vrstva objektů 1");
+    collisionObjects = [];
+    if(colLayer && colLayer.objects){
+      for(const o of colLayer.objects){
+        if(o.polygon){
+          collisionObjects.push({ type:"polygon", points: o.polygon.map(p=>({ x:o.x + p.x, y:o.y + p.y })) });
+          continue;
+        }
+        if(o.polyline){
+          collisionObjects.push({ type:"polyline", points: o.polyline.map(p=>({ x:o.x + p.x, y:o.y + p.y })) });
+          continue;
+        }
+        if(o.ellipse){
+          // approximate ellipse
+          const pts = [];
+          const cx = o.x + o.width/2, cy = o.y + o.height/2;
+          const rx = o.width/2, ry = o.height/2;
+          const steps = 20;
+          for(let i=0;i<steps;i++){
+            const a = i/steps * Math.PI*2;
+            pts.push({ x: cx + Math.cos(a)*rx, y: cy + Math.sin(a)*ry });
+          }
+          collisionObjects.push({ type:'polygon', points: pts });
+          continue;
+        }
+        // rect
+        collisionObjects.push({ type:'rect', x: o.x, y: o.y, w: o.width, h: o.height });
+      }
+    }
+
+    mapReady = true;
+    console.log('Map loaded', tileMap.width, 'x', tileMap.height, 'tilesets', tilesets.length, 'collisions', collisionObjects.length);
+
+
+    // player spawn
+    player.x = 49 * tileMap.tilewidth;
+    player.y = 59 * tileMap.tileheight;
+  }
+
+  await loadTileMap();
+
+  // HP drain every second (only when gameStarted and not gameOver)
+  setInterval(()=>{
+    if(gameStarted && !gameOver && !paused){
+      player.health -= 5;
+      if(player.health < 0) player.health = 0;
+      if(player.health === 0) gameOver = true;
+    }
+  }, 1000);
+
+  // enemy spawner (tries each second)
+  setInterval(()=> {
+
+  // spawn jen když hra běží normálně a mapa není otevřená
+  if(!gameStarted) return;
+  if(gameOver) return;
+  if(paused) return;
+  if(showMap) return;    // tohle je to hlavní
+  if(enemies.length >= 15) return;
+
+  const pos = randomSpawnPos();
+  if(!pos) return;
+
+  enemies.push({ x: pos.x, y: pos.y, w:20, h:20 });
+
+}, 1000);
+
+  // COLLISION helpers
+  function collide(ax,ay,aw,ah,b){ return ax < b.x + b.w && ax + aw > b.x && ay < b.y + b.h && ay + ah > b.y; }
+  function rectToPolygon(x,y,w,h){ return [{x,y},{x:x+w,y},{x:x+w,y:y+h},{x,y:y+h}]; }
+
+  function projectPolygon(points, axis){
+    let min = points[0].x*axis.x + points[0].y*axis.y;
+    let max = min;
+    for(const p of points){
+      const v = p.x*axis.x + p.y*axis.y;
+      if(v < min) min = v;
+      if(v > max) max = v;
+    }
+    return {min, max};
+  }
+  function intervalsOverlap(a,b){ return !(a.max < b.min || b.max < a.min); }
+
+  function polygonIntersects(polyA, polyB){
+    const polys = [polyA, polyB];
+    for(const poly of polys){
+      for(let i=0;i<poly.length;i++){
+        const p1 = poly[i];
+        const p2 = poly[(i+1)%poly.length];
+        const axis = { x: -(p2.y - p1.y), y: (p2.x - p1.x) };
+        const A = projectPolygon(polyA, axis);
+        const B = projectPolygon(polyB, axis);
+        if(!intervalsOverlap(A,B)) return false;
+      }
+    }
+    return true;
+  }
+
+  function moveWithCollision(px,py,vx,vy){
+    let nx = px + vx, ny = py + vy;
+    const polyX = rectToPolygon(nx + player.offsetX, py + player.offsetY, player.w, player.h);
+    const polyY = rectToPolygon(px + player.offsetX, ny + player.offsetY, player.w, player.h);
+
+    for(const c of collisionObjects){
+      if(c.type === 'rect'){
+        if(collide(nx, py, player.w, player.h, c)) nx = px;
+        if(collide(px, ny, player.w, player.h, c)) ny = py;
+      } else if(c.type === 'polygon'){
+        if(polygonIntersects(polyX, c.points)) nx = px;
+        if(polygonIntersects(polyY, c.points)) ny = py;
+      } else if(c.type === 'polyline'){
+        const thick = 4;
+        for(let i=1;i<c.points.length;i++){
+          const a = c.points[i-1], b = c.points[i];
+          const seg = rectToPolygon(Math.min(a.x,b.x), Math.min(a.y,b.y), Math.abs(a.x-b.x) || thick, Math.abs(a.y-b.y) || thick);
+          if(polygonIntersects(polyX, seg)) nx = px;
+          if(polygonIntersects(polyY, seg)) ny = py;
+        }
+      }
+    }
+
+    // clamp
+    if(mapReady){
+      nx = Math.max(0, Math.min(nx, worldWidth - player.w));
+      ny = Math.max(0, Math.min(ny, worldHeight - player.h));
+    } else {
+      nx = Math.max(0, Math.min(nx, 2000 - player.w));
+      ny = Math.max(0, Math.min(ny, 2000 - player.h));
+    }
+
+    return { x: nx, y: ny };
+  }
+
+  // enemy spawn helpers
+  function rectIntersectsRect(ax,ay,aw,ah, bx,by,bw,bh){
+    return !(ax+aw <= bx || ax >= bx + bw || ay + ah <= by || ay >= by + bh);
+  }
+
+  function testCollisionWithMapRect(testRect){
+    for(const c of collisionObjects){
+      if(c.type === 'rect'){
+        if(rectIntersectsRect(testRect.x, testRect.y, testRect.w, testRect.h, c.x, c.y, c.w, c.h)) return true;
+      } else if(c.type === 'polygon' || c.type === 'polyline'){
+        const rectPoly = rectToPolygon(testRect.x, testRect.y, testRect.w, testRect.h);
+        if(polygonIntersects(rectPoly, c.points)) return true;
+      }
+    }
+    return false;
+  }
+
+  function randomSpawnPos(){
+    const view = {
+      left: camera.x,
+      top: camera.y,
+      right: camera.x + canvas.width / camera.scale,
+      bottom: camera.y + canvas.height / camera.scale
+    };
+    const margin = 200;
+    for(let tries=0; tries<100; tries++){
+      const x = Math.random() * (worldWidth - 20);
+      const y = Math.random() * (worldHeight - 20);
+      if(x > view.left - margin && x < view.right + margin && y > view.top - margin && y < view.bottom + margin) continue;
+      const test = { x, y, w:20, h:20 };
+      if(testCollisionWithMapRect(test)) continue;
+      if(rectIntersectsRect(test.x,test.y,test.w,test.h, player.x,player.y, player.w, player.h)) continue;
+      return { x, y };
+    }
+    return null;
+  }
+
+  // tiles draw
+  function getTilesetFor(gid){
+    for(let i=tilesets.length-1;i>=0;i--) if(gid >= tilesets[i].firstgid) return tilesets[i];
+    return null;
+  }
+  function drawTileLayer(L){
+    const tw = tileMap.tilewidth, th = tileMap.tileheight;
+    const vw = canvas.width / camera.scale;
+    const vh = canvas.height / camera.scale;
+    const sx = Math.floor(camera.x / tw) - 1, ex = Math.ceil((camera.x + vw) / tw) + 1;
+    const sy = Math.floor(camera.y / th) - 1, ey = Math.ceil((camera.y + vh) / th) + 1;
+    for(let y = sy; y<=ey; y++){
+      if(y<0||y>=L.height) continue;
+      for(let x = sx; x<=ex; x++){
+        if(x<0||x>=L.width) continue;
+        const id = L.data[y*L.width + x];
+        if(!id) continue;
+        const ts = getTilesetFor(id);
+        if(!ts) continue;
+        const local = id - ts.firstgid;
+        const sx2 = (local % ts.columns) * ts.tilewidth;
+        const sy2 = Math.floor(local / ts.columns) * ts.tileheight;
+        ctx.drawImage(ts.image, sx2, sy2, ts.tilewidth, ts.tileheight, x*tw, y*th, tw, th);
+      }
+    }
+  }
+
+  let showMap = false;
+  document.addEventListener('keydown', e=>{
+  if(e.key.toLowerCase()==='m'){
+    showMap = !showMap;
+    paused = showMap;
+
+    document.getElementById("bigMap").style.display = showMap ? 'block' : 'none';
+  }
+});
+  document.getElementById('mapBtn').onclick = ()=>{
+   showMap = !showMap;
+   paused = showMap;
+   document.getElementById("bigMap").style.display = showMap ? 'block' : 'none';
+}
+
+  function drawMap(){
+    if(!mapReady) return;
+    const mapSize = 300;
+    const scale = mapSize / Math.max(worldWidth, worldHeight);
+    const pad = 10;
+    const px = canvas.width - mapSize - pad - 10;
+    const py = pad;
+    ctx.save();
+
+    // tiles on map
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(px-10, py-10, mapSize+20, mapSize+20);
+    ctx.fillStyle = '#222';
+    ctx.fillRect(px, py, mapSize, mapSize);
+
+    for (let layer of tileMap.layers){
+      if(layer.type !== 'tilelayer' || !layer.visible) continue;
+      const tw = tileMap.tilewidth, th = tileMap.tileheight;
+      for(let y=0;y<layer.height;y++){
+        for(let x=0;x<layer.width;x++){
+          const tileId = layer.data[y*layer.width + x];
+          if(!tileId) continue;
+          ctx.fillStyle = '#666';
+          ctx.fillRect(px + x*tw*scale, py + y*th*scale, Math.max(1, tw*scale), Math.max(1, th*scale));
+        }
+      }
+      break;
+    }
+
+    // collisions on minimap
+    ctx.fillStyle = 'rgba(200,50,50,0.8)';
+    for(const c of collisionObjects){
+      if(c.type === 'rect'){
+        ctx.fillRect(px + c.x*scale, py + c.y*scale, Math.max(1, c.w*scale), Math.max(1, c.h*scale));
+      } else if(c.type === 'polygon' || c.type === 'polyline'){
+        ctx.beginPath();
+        ctx.moveTo(px + c.points[0].x*scale, py + c.points[0].y*scale);
+        for(let i=1;i<c.points.length;i++) ctx.lineTo(px + c.points[i].x*scale, py + c.points[i].y*scale);
+        if(c.type==='polygon') ctx.closePath();
+        ctx.fill();
+      }
+    }
+
+    // enemies on minimap (use image only if loaded)
+    for(const e of enemies){
+      if(enemyImg.complete && enemyImg.naturalWidth > 0){
+        ctx.drawImage(enemyImg, px + e.x*scale, py + e.y*scale, Math.max(3, e.w*scale), Math.max(3, e.h*scale));
+      } else {
+        ctx.fillStyle = 'red';
+        ctx.fillRect(px + e.x*scale, py + e.y*scale, Math.max(3, e.w*scale), Math.max(3, e.h*scale));
+      }
+    }
+
+    // player on minimap
+    ctx.fillStyle = '#0f0';
+    ctx.fillRect(px + player.x*scale - 2, py + player.y*scale - 2, 4, 4);
+
+    ctx.restore();
+  }
+
+  // joystick (existing)
+  const joystick = document.getElementById('joystick');
+  const knob = document.getElementById('joystickKnob');
+  const dashBtn = document.getElementById('dashBtn');
+  let joyActive=false;
+  window.joyX = 0; window.joyY = 0;
+  const deadZone = 0.25, knobRadius = 40;
+
+  function resetKnob(){ knob.style.transform = 'translate(0px,0px)'; window.joyX = 0; window.joyY = 0; }
+  resetKnob();
+
+  function drawMapFullscreen(){
+
+  if(!tileMap) return;
+
+  // čistý canvase
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  // SPOČÍTAT SCALE PRO CELÝ SVĚT
+  const scale = Math.min(
+    canvas.width / worldWidth,
+    canvas.height / worldHeight
+  );
+
+  const offsetX = (canvas.width - worldWidth * scale)/2;
+  const offsetY = (canvas.height - worldHeight * scale)/2;
+
+  ctx.save();
+  ctx.setTransform(scale,0,0,scale,offsetX,offsetY);
+
+  // === DLAŽDICE CELÉ MAPY ===
+  for(let L of tileMap.layers){
+    if(L.type === 'tilelayer' && L.visible){
+
+      const tw = tileMap.tilewidth;
+      const th = tileMap.tileheight;
+
+      for(let y=0;y<L.height;y++){
+        for(let x=0;x<L.width;x++){
+
+          const id = L.data[y*L.width + x];
+          if(!id) continue;
+
+          const ts = getTilesetFor(id);
+          if(!ts) continue;
+
+          const local = id - ts.firstgid;
+          const sx = (local % ts.columns) * ts.tilewidth;
+          const sy = Math.floor(local / ts.columns) * ts.tileheight;
+
+          ctx.drawImage(
+            ts.image,
+            sx,sy,ts.tilewidth,ts.tileheight,
+            x*tw, y*th, tw,th
+          );
+        }
+      }
+    }
+  }
+
+  // === ENEMY ===
+  ctx.fillStyle="red";
+  for(const e of enemies){
+    ctx.fillRect(e.x,e.y,e.w,e.h);
+  }
+
+  // === PLAYER ===
+  ctx.fillStyle="lime";
+  ctx.fillRect(player.x,player.y,player.w,player.h);
+
+  ctx.restore();
+}
+
+
+
+  joystick.addEventListener('pointerdown', e=> { joyActive=true; updateFromPoint(e); });
+  window.addEventListener('pointermove', e=> { if(!joyActive) return; updateFromPoint(e); });
+  window.addEventListener('pointerup', e=> { joyActive=false; resetKnob(); });
+  joystick.addEventListener('touchstart', e=>{ updateFromPoint(e.touches[0]); e.preventDefault(); }, {passive:false});
+  joystick.addEventListener('touchmove', e=>{ updateFromPoint(e.touches[0]); e.preventDefault(); }, {passive:false});
+  joystick.addEventListener('touchend', e=>{ resetKnob(); e.preventDefault(); }, {passive:false});
+  dashBtn.addEventListener('pointerdown', e=>{ e.stopPropagation(); tryDash(); e.preventDefault(); });
+  dashBtn.addEventListener('click', ()=> tryDash());
+
+  // fullscreen
+  const fsBtn = document.getElementById('fsBtn');
+  fsBtn.addEventListener('click', ()=> { if(document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(()=>{}); });
+
+  function updateUI(){
+    // ukazovat gameplay UI pouze když hra běží a není pauza
+    const showGameplayUI = (gameStarted && !paused);
+
+    joystick.style.display = showGameplayUI ? "" : "none";
+    dashBtn.style.display = showGameplayUI ? "" : "none";
+    document.getElementById('fsBtn').style.display = showGameplayUI ? "" : "none";
+
+    // MAP BUTTON = musí být vidět pouze pokud hra běží
+    if (gameStarted){
+        document.getElementById('mapBtn').style.display = "";
+    } else {
+        document.getElementById('mapBtn').style.display = "none";
+    }
+}
+
+  // debug toggle 'k'
+  let debugCollisions = false;
+  document.addEventListener('keydown', e=>{
+    if(e.key.toLowerCase() === 'k') debugCollisions = !debugCollisions;
+  });
+
+  // SCORE counting per second (when gameStarted and not gameOver)
+  let scoreTimer = 0;
+
+function doGameOver(){
+    gameOver = true;
+
+    // zobraz obrázek
+    document.getElementById("gameOverScreen").style.display="block";
+
+    // zobraz score v rámečku
+    const ctx = document.getElementById("game").getContext("2d");
+    setTimeout(()=>{
+       ctx.setTransform(1,0,0,1,0,0);
+       ctx.fillStyle="black";
+       ctx.font="48px serif";
+       ctx.fillText(score, window.innerWidth/2-30, window.innerHeight/2+30);
+    },50);
+
+    // kliknutí restart
+    document.body.addEventListener("click", ()=>location.reload());
+}
+
+  // MAIN LOOP
+if(gameOver){
+   return;
+}
+
+if(gameOver){
+    requestAnimationFrame(loop);
+    return;
+}
+  let last = performance.now();
+  function loop(ts){
+    const dt = (ts - last) / 1000; last = ts;
+
+    if(gameStarted && !gameOver && !paused){
+      scoreTimer += dt;
+      if(scoreTimer >= 1){
+        score++; scoreTimer = 0;
+      }
+    }
+
+    // update UI visiblity
+    updateUI();
+
+    // movement/dash
+    player.dashTimer = Math.max(0, player.dashTimer - dt);
+    let dx=0, dy=0;
+// =================== PAUSE ===================
+if(paused){
+   ctx.setTransform(1,0,0,1,0,0);
+   drawMapFullscreen();
+   requestAnimationFrame(loop);    // NEZASTAVUJ LOOP!
+   return;
+}
+
+    if(player.isDashing){
+      player.dashTime -= dt;
+      const res = moveWithCollision(player.x, player.y, player.dashVX*dt, player.dashVY*dt);
+      player.x = res.x; player.y = res.y;
+      if(player.dashTime <= 0) player.isDashing = false;
+    } else {
+      if(keys.w || keys.ArrowUp) dy -= 1;
+      if(keys.s || keys.ArrowDown) dy += 1;
+      if(keys.a || keys.ArrowLeft) dx -= 1;
+      if(keys.d || keys.ArrowRight) dx += 1;
+      if(dx===0 && dy===0 && Math.hypot(window.joyX, window.joyY) > 0.001){ dx = window.joyX; dy = window.joyY; }
+      if(dx !== 0 || dy !== 0){
+        const L = Math.hypot(dx,dy); dx/=L; dy/=L;
+        const m = moveWithCollision(player.x, player.y, dx*player.speed*dt, dy*player.speed*dt);
+        player.x = m.x; player.y = m.y;
+      }
+    }
+// --- ANIMACE HRÁČE ---
+if (dx || dy) {
+  let newCol = player.anim.col;
+  if (Math.abs(dx) > Math.abs(dy)) newCol = dx > 0 ? 2 : 0;
+  else newCol = dy > 0 ? 1 : 3;
+
+  if (newCol !== player.anim.col) {
+    player.anim.col = newCol;
+    player.anim.frame = 0;
+    player.anim.timer = 0;
+  }
+
+  player.anim.timer += dt;
+  if (player.anim.timer > player.anim.speed) {
+    player.anim.timer = 0;
+    player.anim.frame = (player.anim.frame + 1) % player.anim.framesPerDir;
+  }
+} else {
+  player.anim.frame = 0;
+}
+
+    // check player death
+    if(player.health <= 0 && !gameOver){
+      gameOver = true;
+    }
+
+    // camera center
+    camera.x = player.x + player.w/2 - canvas.width/(2*camera.scale);
+    camera.y = player.y + player.h/2 - canvas.height/(2*camera.scale);
+    camera.x = Math.max(0, Math.min(camera.x, worldWidth - canvas.width/camera.scale));
+    camera.y = Math.max(0, Math.min(camera.y, worldHeight - canvas.height/camera.scale));
+
+    // clear and transform
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.setTransform(camera.scale,0,0,camera.scale, -camera.x*camera.scale, -camera.y*camera.scale);
+
+    // draw tiles
+    if(mapReady){
+      for(const L of tileMap.layers) if(L.type==='tilelayer' && L.visible) drawTileLayer(L);
+    } else {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(0,0,2000,2000);
+    }
+
+    // debug collisions
+    if(debugCollisions){
+      ctx.save();
+      ctx.strokeStyle = 'red';
+      ctx.lineWidth = 1 / camera.scale;
+      for(const c of collisionObjects){
+        if(c.type === 'rect'){
+          ctx.strokeRect(c.x, c.y, c.w, c.h);
+        } else if(c.type === 'polygon'){
+          ctx.beginPath();
+          ctx.moveTo(c.points[0].x, c.points[0].y);
+          for(let i=1;i<c.points.length;i++) ctx.lineTo(c.points[i].x, c.points[i].y);
+          ctx.closePath();
+          ctx.stroke();
+        } else if(c.type === 'polyline'){
+          ctx.beginPath();
+          ctx.moveTo(c.points[0].x, c.points[0].y);
+          for(let i=1;i<c.points.length;i++) ctx.lineTo(c.points[i].x, c.points[i].y);
+          ctx.stroke();
+        }
+      }
+      ctx.restore();
+    }
+
+    // draw enemies (world coords) — use image if ready, otherwise fallback square
+    for(const e of enemies){
+      if(enemyImg.complete && enemyImg.naturalWidth > 0){
+        ctx.drawImage(enemyImg, e.x, e.y, e.w, e.h);
+      } else {
+        ctx.fillStyle = 'red';
+        ctx.fillRect(e.x, e.y, e.w, e.h);
+      }
+    }
+
+    // player vs enemy collisions
+    for (let i = enemies.length - 1; i >= 0; i--) {
+      const e = enemies[i];
+      const touch = player.x < e.x + e.w && player.x + player.w > e.x && player.y < e.y + e.h && player.y + player.h > e.y;
+      if (touch) {
+        enemies.splice(i,1);
+        player.health += 10;
+        if(player.health > player.maxHealth) player.health = player.maxHealth;
+      }
+    }
+
+    // draw player
+    const frameW = 14, frameH = 24;
+    let pimg = imgDown;
+    if(player.anim.col === 0) pimg = imgLeft;
+    if(player.anim.col === 1) pimg = imgDown;
+    if(player.anim.col === 2) pimg = imgRight;
+    if(player.anim.col === 3) pimg = imgUp;
+    const row = player.anim.frame % 4;
+    const drawX = player.x + player.w/2 - frameW/2;
+    const drawY = player.y + player.h/2 - frameH;
+    ctx.drawImage(pimg, 0, row*frameH, frameW, frameH, Math.round(drawX - frameW/2), Math.round(drawY), frameW*2, frameH*2);
+
+    // health bar (nad hráčem)
+const hpWidth = 40;
+const hpHeight = 6;
+const hpPercent = player.health / player.maxHealth;
+
+ctx.fillStyle = "black";
+ctx.fillRect(player.x -6, player.y - 40, hpWidth, hpHeight);
+
+ctx.fillStyle = "red";
+ctx.fillRect(player.x -6, player.y - 40, hpWidth * hpPercent, hpHeight);
+
+// ----- SCORE nad health -----
+ctx.fillStyle = "white";
+ctx.font = "14px sans-serif";
+ctx.fillText("Score: " + Math.floor(score), player.x - 20, player.y - 50);
+
+// -------- HUD ------------
+ctx.setTransform(1,0,0,1,0,0);
+ctx.fillStyle = '#fff';
+ctx.font = '16px sans-serif';
+ctx.fillText('Dash ready in: ' + player.dashTimer.toFixed(2), 10, 20);
+ctx.fillText('Shift = dash | M = map | K = debug collisions', 10, 40);
+
+    // if gameOver, draw big centered score overlay and stop updates (but still render background)
+    if(gameOver){
+if(gameOver){
+  document.getElementById("gameOverScreen").style.display = "block";
+document.getElementById("scoreOver").innerText = score;
+document.getElementById("scoreOver").style.display = "block";
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle = 'red';
+  ctx.font = '48px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText("Score: " + Math.floor(score), canvas.width / 2, canvas.height / 2);
+
+  return;
+}
+
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.fillStyle = '#fff';
+      ctx.font = '48px Arial';
+      ctx.textAlign = 'center';
+      ctx.fillText("", canvas.width/2, canvas.height/2 - 40);
+      ctx.font = '128px Arial';
+      ctx.fillText(String(score), canvas.width/2, canvas.height/2 + 40);
+      // don't request next frame to freeze (but still allow UI interactions)
+      return;
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  requestAnimationFrame(loop);
+
+  // start button behaviour
+  const startBtn = document.getElementById('startBtn');
+  const startScreen = document.getElementById('startScreen');
+  startBtn.onclick = ()=> {
+    startScreen.style.display = 'none';
+    startBtn.style.display = 'none';
+    gameStarted = true;
+  };
+
+}); 
+document.addEventListener("click", () => {
+    if (gameOver) {
+        location.reload();
+    }
+});
+</script>
+</body>
+</html>
